@@ -1,0 +1,216 @@
+// =====================================================================================
+// Defender Advanced Hunting source tests
+// =====================================================================================
+// Run in the Defender portal: Hunting > Advanced hunting. Each test is a separate query.
+// Put the cursor in a query and select Run query, then Export to CSV and save the result
+// as output\defender\<test id>.csv beside these scripts.
+//
+// Before running:
+//   1. Run 01_netbox_export.py --site <pilot> and paste the line from
+//      output\netbox\pilot_kql_let.txt over every "let SitePrefixes" line below.
+//   2. Set the time picker to "Last 30 days" unless a query sets its own range.
+//
+// Limits: native Defender data covers 30 days; each query returns up to 100,000 rows and
+// runs for up to 10 minutes. The queries summarise for that reason. If one times out,
+// shorten the window (ago(30d) to ago(7d)) and note that in the results.
+// =====================================================================================
+
+
+// -------------------------------------------------------------------------------------
+// D1  Retention: earliest and latest event per table, and whether the tables are present.
+//     Tables streamed to Sentinel can go back further than 30 days: if Earliest is older
+//     than 30 days, longer retention is available for that table.
+// -------------------------------------------------------------------------------------
+union isfuzzy=true withsource=TableName
+    DeviceInfo, DeviceNetworkInfo, DeviceNetworkEvents, DeviceLogonEvents,
+    IdentityLogonEvents, IdentityQueryEvents, IdentityDirectoryEvents
+| where Timestamp > ago(400d)
+| summarize Earliest = min(Timestamp), Latest = max(Timestamp) by TableName
+| extend DaysAvailable = datetime_diff('day', Latest, Earliest)
+| order by TableName asc
+
+
+// -------------------------------------------------------------------------------------
+// D2  Pilot office coverage: onboarded devices with an IP in the pilot prefixes, by type
+//     and OS. Compare the server count with RunZero's server count for the same prefixes.
+// -------------------------------------------------------------------------------------
+let SitePrefixes = dynamic(["10.20.0.0/16"]);   // replace from pilot_kql_let.txt
+DeviceNetworkInfo
+| where Timestamp > ago(7d)
+| mv-expand IPEntry = IPAddresses
+| extend IP = tostring(IPEntry.IPAddress)
+| where ipv4_is_in_any_range(IP, SitePrefixes)
+| summarize LastSeen = max(Timestamp), IPs = make_set(IP, 10) by DeviceId, DeviceName
+| join kind=leftouter (
+    DeviceInfo
+    | where Timestamp > ago(7d)
+    | summarize arg_max(Timestamp, OSPlatform, OSVersion, DeviceType, OnboardingStatus, SensorHealthState) by DeviceId
+  ) on DeviceId
+| project DeviceName, DeviceType, OSPlatform, OSVersion, OnboardingStatus, SensorHealthState, LastSeen, IPs
+| order by DeviceType asc, DeviceName asc
+
+
+// -------------------------------------------------------------------------------------
+// D3  Devices Defender has discovered but not onboarded (device discovery), by type.
+//     These have no agent, so their own connections are invisible to Defender.
+// -------------------------------------------------------------------------------------
+DeviceInfo
+| where Timestamp > ago(7d)
+| summarize arg_max(Timestamp, DeviceName, DeviceType, OSPlatform, OnboardingStatus) by DeviceId
+| summarize Devices = count() by OnboardingStatus, DeviceType, OSPlatform
+| order by OnboardingStatus asc, Devices desc
+
+
+// -------------------------------------------------------------------------------------
+// D4  Listening services on pilot office devices (ListeningConnectionCreated).
+//     Feeds the Listening services field and the security baseline.
+// -------------------------------------------------------------------------------------
+let SitePrefixes = dynamic(["10.20.0.0/16"]);
+let SiteDevices = DeviceNetworkInfo
+    | where Timestamp > ago(7d)
+    | mv-expand IPEntry = IPAddresses
+    | where ipv4_is_in_any_range(tostring(IPEntry.IPAddress), SitePrefixes)
+    | distinct DeviceId;
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where DeviceId in (SiteDevices)
+| where ActionType == "ListeningConnectionCreated"
+| summarize Ports = make_set(strcat(LocalPort, "/", Protocol), 50),
+            Processes = make_set(InitiatingProcessFileName, 20),
+            LastSeen = max(Timestamp) by DeviceName
+| order by DeviceName asc
+
+
+// -------------------------------------------------------------------------------------
+// D5  Inbound connections to pilot office devices: who connects, from where, to which
+//     port and process. Map RemoteIP to an office with site_prefixes.csv afterwards.
+// -------------------------------------------------------------------------------------
+let SitePrefixes = dynamic(["10.20.0.0/16"]);
+let SiteDevices = DeviceNetworkInfo
+    | where Timestamp > ago(7d)
+    | mv-expand IPEntry = IPAddresses
+    | where ipv4_is_in_any_range(tostring(IPEntry.IPAddress), SitePrefixes)
+    | distinct DeviceId;
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where DeviceId in (SiteDevices)
+| where ActionType == "InboundConnectionAccepted"
+| extend FromPilotOffice = ipv4_is_in_any_range(RemoteIP, SitePrefixes)
+| summarize Connections = count(), DistinctSources = dcount(RemoteIP),
+            SampleSources = make_set(RemoteIP, 20)
+            by DeviceName, LocalPort, InitiatingProcessFileName, FromPilotOffice
+| top 500 by Connections desc
+
+
+// -------------------------------------------------------------------------------------
+// D6  Outbound connections from pilot office servers: process attribution and how often
+//     RemoteUrl (the name looked up) is filled. Low PctWithUrl to private IPs is the
+//     hard-coded-IP lead.
+// -------------------------------------------------------------------------------------
+let SitePrefixes = dynamic(["10.20.0.0/16"]);
+let SiteServers = DeviceNetworkInfo
+    | where Timestamp > ago(7d)
+    | mv-expand IPEntry = IPAddresses
+    | where ipv4_is_in_any_range(tostring(IPEntry.IPAddress), SitePrefixes)
+    | distinct DeviceId
+    | join kind=inner (DeviceInfo | where Timestamp > ago(7d) | where DeviceType == "Server" | distinct DeviceId) on DeviceId
+    | project DeviceId;
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where DeviceId in (SiteServers)
+| where ActionType == "ConnectionSuccess"
+| summarize Connections = count(), WithUrl = countif(isnotempty(RemoteUrl)),
+            Destinations = dcount(RemoteIP), SampleDestinations = make_set(RemoteIP, 10)
+            by DeviceName, InitiatingProcessFileName, RemotePort, RemoteIPType
+| extend PctWithUrl = round(100.0 * WithUrl / Connections, 1)
+| top 500 by Connections desc
+
+
+// -------------------------------------------------------------------------------------
+// D7  Devices without the agent talking to pilot office devices
+//     (ConnectionAcknowledged / ConnectionAttempt / InboundConnectionAccepted from IPs that
+//     belong to no onboarded device). Finds printers, OT, appliances and unknown clients.
+// -------------------------------------------------------------------------------------
+let SitePrefixes = dynamic(["10.20.0.0/16"]);
+let OnboardedIPs = DeviceNetworkInfo
+    | where Timestamp > ago(7d)
+    | mv-expand IPEntry = IPAddresses
+    | distinct IP = tostring(IPEntry.IPAddress);
+let SiteDevices = DeviceNetworkInfo
+    | where Timestamp > ago(7d)
+    | mv-expand IPEntry = IPAddresses
+    | where ipv4_is_in_any_range(tostring(IPEntry.IPAddress), SitePrefixes)
+    | distinct DeviceId;
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where DeviceId in (SiteDevices)
+| where ActionType in ("ConnectionAcknowledged", "ConnectionAttempt", "InboundConnectionAccepted")
+| where ipv4_is_private(RemoteIP)
+| join kind=leftanti OnboardedIPs on $left.RemoteIP == $right.IP
+| summarize Connections = count(), LocalPorts = make_set(LocalPort, 20), Devices = make_set(DeviceName, 10)
+            by RemoteIP, ActionType
+| top 500 by Connections desc
+
+
+// -------------------------------------------------------------------------------------
+// D8  Logons on pilot office devices: logon type and protocol (Kerberos / NTLM), with
+//     distinct accounts. Batch and Service logons point at scheduled jobs and service accounts.
+// -------------------------------------------------------------------------------------
+let SitePrefixes = dynamic(["10.20.0.0/16"]);
+let SiteDevices = DeviceNetworkInfo
+    | where Timestamp > ago(7d)
+    | mv-expand IPEntry = IPAddresses
+    | where ipv4_is_in_any_range(tostring(IPEntry.IPAddress), SitePrefixes)
+    | distinct DeviceId;
+DeviceLogonEvents
+| where Timestamp > ago(7d)
+| where DeviceId in (SiteDevices)
+| where ActionType == "LogonSuccess"
+| summarize Logons = count(), Accounts = dcount(AccountName), SampleAccounts = make_set(AccountName, 10)
+            by DeviceName, LogonType, Protocol
+| order by DeviceName asc, Logons desc
+
+
+// -------------------------------------------------------------------------------------
+// D9  Defender for Identity: is it deployed, and which protocols does it record?
+//     LDAP cleartext (simple bind) from pilot office IPs is a legacy-protocol exception.
+// -------------------------------------------------------------------------------------
+let SitePrefixes = dynamic(["10.20.0.0/16"]);
+IdentityLogonEvents
+| where Timestamp > ago(7d)
+| extend FromPilotOffice = ipv4_is_in_any_range(IPAddress, SitePrefixes)
+| summarize Events = count(), Accounts = dcount(AccountUpn), SampleSources = make_set(DeviceName, 10)
+            by Protocol, LogonType, FromPilotOffice
+| order by FromPilotOffice desc, Events desc
+
+
+// -------------------------------------------------------------------------------------
+// D10 Installed software and end-of-support status on pilot office devices.
+// -------------------------------------------------------------------------------------
+let SitePrefixes = dynamic(["10.20.0.0/16"]);
+let SiteDevices = DeviceNetworkInfo
+    | where Timestamp > ago(7d)
+    | mv-expand IPEntry = IPAddresses
+    | where ipv4_is_in_any_range(tostring(IPEntry.IPAddress), SitePrefixes)
+    | distinct DeviceId;
+DeviceTvmSoftwareInventory
+| where DeviceId in (SiteDevices)
+| summarize Devices = dcount(DeviceId), SampleDevices = make_set(DeviceName, 10)
+            by SoftwareVendor, SoftwareName, SoftwareVersion, EndOfSupportStatus, EndOfSupportDate
+| order by Devices desc
+
+
+// -------------------------------------------------------------------------------------
+// D11 Volume cross-check for one flow. Pick one server-to-server flow that crosses a
+//     firewall (from D6), set the two IPs and port, and compare the daily count with
+//     Splunk test S6. A large gap means Defender counts can't be used for volume.
+// -------------------------------------------------------------------------------------
+let SourceIP = "10.20.4.21";      // replace
+let DestIP   = "10.30.4.22";      // replace
+let DestPort = 1433;              // replace
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where LocalIP == SourceIP and RemoteIP == DestIP and RemotePort == DestPort
+| where ActionType == "ConnectionSuccess"
+| summarize Connections = count() by bin(Timestamp, 1d)
+| order by Timestamp asc

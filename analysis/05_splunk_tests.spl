@@ -1,0 +1,157 @@
+``` ===================================================================================== ```
+``` Splunk source tests ```
+``` ===================================================================================== ```
+``` Run each search separately in Splunk Search & Reporting. Export results as CSV and save ```
+``` them as output\splunk\<test id>.csv beside these scripts. ```
+```  ```
+``` Placeholders to replace once S1 shows your real index and sourcetype names: ```
+```   <FW_INDEX>     firewall traffic logs        <DNS_INDEX>   DNS query logs ```
+```   <WIN_INDEX>    Windows event logs (DCs)     <ZS_INDEX>    Zscaler NSS / LSS logs ```
+```   <FW_ST>, <DNS_ST>, <ZIA_WEB_ST>, <ZPA_ST>     the matching sourcetypes ```
+```  ```
+``` Field names (src, dest, dest_port, bytes, query, user...) follow the Splunk CIM, which ```
+``` most vendor add-ons map to. S3 shows the real field names; adjust the later searches to ```
+``` match before running them. ```
+```  ```
+``` The pilot office filter uses cidrmatch(). Paste the clause from ```
+``` output\netbox\pilot_spl_cidr.txt (it uses "src"; copy it and change src to dest where ```
+``` a search needs the destination side). ```
+```  ```
+``` Optional, for all offices at once: upload output\netbox\site_prefixes.csv as a lookup ```
+``` file, create a lookup definition "site_prefixes" with Advanced options > Match type ```
+``` CIDR(prefix), then use: | lookup site_prefixes prefix AS src OUTPUT site_slug AS src_site ```
+``` ===================================================================================== ```
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S1  Index and sourcetype inventory with earliest and latest event. Time range: All time. ```
+```     tstats reads index metadata only, so this is fast even over all time. ```
+``` ------------------------------------------------------------------------------------- ```
+| tstats count min(_time) as earliest max(_time) as latest where index=* by index sourcetype
+| eval days_held = round((latest - earliest) / 86400, 0)
+| convert ctime(earliest) ctime(latest)
+| sort index sourcetype
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S2  Configured retention per index. Needs permission to run | rest; on Splunk Cloud this ```
+```     may be refused, in which case use days_held from S1 and ask the Splunk admin. ```
+``` ------------------------------------------------------------------------------------- ```
+| rest /services/data/indexes count=0
+| eval retention_days = round(frozenTimePeriodInSecs / 86400, 0)
+| table title retention_days maxTotalDataSizeMB currentDBSizeMB totalEventCount minTime maxTime
+| sort title
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S3  Field discovery for one sourcetype. Run once per candidate source (firewall, DNS, ```
+```     Windows Security, Zscaler). Shows which fields exist and how often they're filled. ```
+``` ------------------------------------------------------------------------------------- ```
+index=<FW_INDEX> sourcetype=<FW_ST> earliest=-24h
+| head 10000
+| fieldsummary maxvals=5
+| eval populated_pct = round(100 * count / 10000, 1)
+| table field populated_pct distinct_count values
+| sort - populated_pct
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S4  Firewall coverage of the pilot office: which pilot source IPs appear in the last 7 ```
+```     days, and whether bytes are recorded. Few or no rows means traffic inside the office ```
+```     doesn't cross a firewall that logs to Splunk. ```
+``` ------------------------------------------------------------------------------------- ```
+index=<FW_INDEX> sourcetype=<FW_ST> earliest=-7d
+| where (cidrmatch("10.20.0.0/16", src))
+| stats count as events sum(bytes) as bytes dc(dest) as destinations by src
+| eval has_bytes = if(isnull(bytes), "no", "yes")
+| sort - events
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S5  Pilot office flows (both directions), summarised by source, destination and port. ```
+```     Feeds the Dependencies tab. Map dest to an office with the site_prefixes lookup. ```
+``` ------------------------------------------------------------------------------------- ```
+index=<FW_INDEX> sourcetype=<FW_ST> earliest=-7d
+| where (cidrmatch("10.20.0.0/16", src)) OR (cidrmatch("10.20.0.0/16", dest))
+| stats count as events sum(bytes) as bytes by src dest dest_port transport action
+| eval gb = round(bytes / 1073741824, 3)
+| sort - events
+| head 5000
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S6  Long-window check for one server: daily events over the full retention. Shows ```
+```     whether monthly, quarterly and year-end activity is visible. Replace the IP; TERM() ```
+```     keeps the search fast. Time range: All time (or the retention from S1). ```
+``` ------------------------------------------------------------------------------------- ```
+index=<FW_INDEX> sourcetype=<FW_ST> TERM(10.20.4.77)
+| timechart span=1d count
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S7  DNS query logs: is there a source, does it record the client IP, query and answer, ```
+```     and does it cover the pilot office? ```
+``` ------------------------------------------------------------------------------------- ```
+| tstats count min(_time) as earliest max(_time) as latest where index=* (sourcetype=*dns* OR source=*dns*) by index sourcetype
+| convert ctime(earliest) ctime(latest)
+
+index=<DNS_INDEX> sourcetype=<DNS_ST> earliest=-24h
+| where (cidrmatch("10.20.0.0/16", src))
+| stats count dc(query) as distinct_queries values(record_type) as record_types by src
+| sort - count
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S8  Domain controller security events: is each DC forwarding, and which authentication ```
+```     packages and logon types appear? Field names differ between the classic and XML ```
+```     Windows add-ons; S3 on this sourcetype shows which you have. ```
+```     4624 logon, 4768/4769 Kerberos, 4776 NTLM credential validation. ```
+``` ------------------------------------------------------------------------------------- ```
+index=<WIN_INDEX> (source="*WinEventLog:Security" OR source="*XmlWinEventLog:Security") EventCode IN (4624, 4768, 4769, 4776) earliest=-24h
+| eval auth_package = coalesce(Authentication_Package, AuthenticationPackageName, Package_Name)
+| eval logon_type = coalesce(Logon_Type, LogonType)
+| stats count by host EventCode auth_package logon_type
+| sort host EventCode
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S9  LDAP signing events from domain controllers. 2887 is a daily summary of unsigned and ```
+```     cleartext binds; 2889 lists each client, but only when LDAP Interface Events ```
+```     diagnostic logging is set to 2 on the DC. Either needs the Directory Service log ```
+```     forwarded to Splunk. ```
+``` ------------------------------------------------------------------------------------- ```
+index=<WIN_INDEX> source="*Directory Service*" (EventCode=2887 OR EventCode=2889) earliest=-30d
+| stats count latest(_time) as latest by host EventCode
+| convert ctime(latest)
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S10 Zscaler logs in Splunk (ZIA NSS and ZPA LSS feeds): which sourcetypes, how far back. ```
+``` ------------------------------------------------------------------------------------- ```
+| tstats count min(_time) as earliest max(_time) as latest where index=* (sourcetype=*zscaler* OR sourcetype=*zia* OR sourcetype=*zpa*) by index sourcetype
+| eval days_held = round((latest - earliest) / 86400, 0)
+| convert ctime(earliest) ctime(latest)
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S11 ZIA web logs: users, apps and volume per ZIA location (office), last 7 days. ```
+```     Run S3 on <ZIA_WEB_ST> first: NSS feed fields are set per feed, so names vary ```
+```     (for example location, user or login, appname, appclass, reqsize/respsize). ```
+``` ------------------------------------------------------------------------------------- ```
+index=<ZS_INDEX> sourcetype=<ZIA_WEB_ST> earliest=-7d
+| stats dc(user) as users dc(appname) as apps count as transactions by location
+| sort - transactions
+
+index=<ZS_INDEX> sourcetype=<ZIA_WEB_ST> earliest=-7d location="<pilot ZIA location>"
+| stats dc(user) as users count as transactions by appname appclass
+| sort - users
+| head 200
+
+
+``` ------------------------------------------------------------------------------------- ```
+``` S12 ZPA user activity logs: applications reached, by user count, last 7 days. ```
+```     Field names depend on the LSS log template; run S3 on <ZPA_ST> first. ```
+``` ------------------------------------------------------------------------------------- ```
+index=<ZS_INDEX> sourcetype=<ZPA_ST> earliest=-7d
+| stats dc(Username) as users count as sessions by Application AppGroup
+| sort - users
